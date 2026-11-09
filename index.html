@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>筆順レコーダー</title>
+<style>
+  body {
+    font-family: sans-serif;
+    text-align: center;
+    margin: 0;
+    padding: 16px;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  button {
+    font-size: 20px;
+    padding: 12px 28px;
+    margin: 8px;
+    touch-action: manipulation;
+  }
+  input, select {
+    font-size: 18px;
+    padding: 6px;
+  }
+  #prompt {
+    font-size: 96px;
+    margin: 8px 0;
+  }
+  #box {
+    position: relative;
+    width: min(60vh, 90vw);
+    aspect-ratio: 1;
+    margin: 0 auto;
+    border: 2px solid #3e8767;
+  }
+  #box::before, #box::after {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+  }
+  #box::before {
+    left: 50%; top: 0; bottom: 0;
+    border-left: 1px dashed #9cc5b1;
+  }
+  #box::after {
+    top: 50%; left: 0; right: 0;
+    border-top: 1px dashed #9cc5b1;
+  }
+  #cv {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+    touch-action: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- 設定画面 -->
+<div id="setup">
+  <h1>筆順レコーダー</h1>
+  <p>参加者ID <input id="pid" placeholder="例：J01"></p>
+  <p>群
+    <select id="group">
+      <option value="JP">日本語母語話者</option>
+      <option value="MM">ミャンマー語母語話者</option>
+    </select>
+  </p>
+  <p>課題の文字 <input id="items" size="24" value="のめねもやをたシツソンネヲ右左田上山"></p>
+  <button id="start">記録を始める</button>
+  <hr>
+  <p id="count"></p>
+  <button id="download">CSVを書き出す</button>
+  <button id="clear">記録を消す</button>
+</div>
+
+<!-- 記録画面 -->
+<div id="task" hidden>
+  <p id="progress"></p>
+  <div id="prompt"></div>
+  <div id="box"><canvas id="cv"></canvas></div>
+  <button id="redo">書き直す</button>
+  <button id="next">次へ</button>
+</div>
+
+<!-- 終了画面 -->
+<div id="done" hidden>
+  <h2>おつかれさまでした</h2>
+  <button id="again">次の参加者へ</button>
+</div>
+
+<script>
+// // ============================================================
+// ① 準備：画面の部品と、データを入れておく変数
+// ============================================================
+const canvas = document.getElementById("cv");
+const ctx = canvas.getContext("2d");
+
+let session = null;    // 今の参加者（ID・群・開始時刻）
+let items = [];        // 出題する文字のリスト
+let index = 0;         // 今が何題目か（0から数える）
+let strokes = [];      // 今の文字で書き終わった画のリスト
+let current = null;    // 今書いている途中の画（点のリスト）
+let currentId = null;  // 今書いているペンの番号
+let startTime = 0;     // 文字を表示した時刻
+let redoCount = 0;     // 書き直した回数
+
+// ============================================================
+// ② ペンで線を描き、点を記録する
+// ============================================================
+
+// canvasの大きさを画面に合わせる
+function setupCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+}
+
+// ペンの情報を「1つの点」にまとめる（座標はマスの左上0〜右下1000）
+function toPoint(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: Math.round((e.clientX - rect.left) / rect.width * 1000),
+    y: Math.round((e.clientY - rect.top) / rect.height * 1000),
+    t: Math.round(e.timeStamp - startTime),
+    pressure: Math.round(e.pressure * 1000) / 1000,
+    tiltX: e.tiltX || 0,
+    tiltY: e.tiltY || 0
+  };
+}
+
+// 2つの点の間に線を引く（筆圧が強いほど太く）
+function drawLine(a, b) {
+  const k = canvas.getBoundingClientRect().width / 1000;
+  ctx.lineWidth = 2 + b.pressure * 6;
+  ctx.beginPath();
+  ctx.moveTo(a.x * k, a.y * k);
+  ctx.lineTo(b.x * k, b.y * k);
+  ctx.stroke();
+}
+
+// ペンが画面に触れたとき：新しい画を始める
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "touch") return;  // 指や手のひらは無視する
+  if (current) return;                    // 書いている途中なら無視する
+  canvas.setPointerCapture(e.pointerId);
+  currentId = e.pointerId;
+  current = [toPoint(e)];
+});
+
+// ペンが動いたとき：点を足して線を引く
+canvas.addEventListener("pointermove", (e) => {
+  if (!current || e.pointerId !== currentId) return;
+  let events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  if (events.length === 0) events = [e];
+  for (const ev of events) {
+    const p = toPoint(ev);
+    drawLine(current[current.length - 1], p);
+    current.push(p);
+  }
+});
+
+// ペンが離れたとき：画を終える
+function endStroke(e) {
+  if (!current || e.pointerId !== currentId) return;
+  strokes.push(current);
+  current = null;
+}
+canvas.addEventListener("pointerup", endStroke);
+canvas.addEventListener("pointercancel", endStroke);
+
+// // ============================================================
+// ③ 出題・書き直し・次へ
+// ============================================================
+
+// 3つの画面のうち1つだけを表示する
+function show(screen) {
+  for (const id of ["setup", "task", "done"]) {
+    document.getElementById(id).hidden = (id !== screen);
+  }
+}
+
+// 「記録を始める」
+function startSession() {
+  const pid = document.getElementById("pid").value.trim().replace(/,/g, "");
+  if (pid === "") {
+    alert("参加者IDを入れてください");
+    return;
+  }
+  items = Array.from(document.getElementById("items").value.replace(/\s/g, ""));
+  if (items.length === 0) {
+    alert("課題の文字を入れてください");
+    return;
+  }
+  session = {
+    pid: pid,
+    group: document.getElementById("group").value,
+    started: new Date().toISOString()
+  };
+  index = 0;
+  show("task");
+  setupCanvas();
+  showItem();
+}
+
+// 今の文字を表示する
+function showItem() {
+  document.getElementById("progress").textContent = (index + 1) + " / " + items.length;
+  document.getElementById("prompt").textContent = items[index];
+  clearBox();
+  redoCount = 0;
+  startTime = performance.now();
+}
+
+// マスを白紙に戻す
+function clearBox() {
+  strokes = [];
+  current = null;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+// 「書き直す」
+document.getElementById("redo").addEventListener("click", () => {
+  clearBox();
+  redoCount++;
+});
+
+// 「次へ」
+document.getElementById("next").addEventListener("click", () => {
+  if (strokes.length === 0 && !confirm("何も書かれていません。このまま次へ進みますか？")) {
+    return;
+  }
+  saveTrial();
+  index++;
+  if (index < items.length) {
+    showItem();
+  } else {
+    show("done");
+  }
+});
+
+document.getElementById("start").addEventListener("click", startSession);
+document.getElementById("again").addEventListener("click", () => {
+  document.getElementById("pid").value = "";
+  updateCount();
+  show("setup");
+});
+// ============================================================
+// ④ iPadに保存し、CSVで書き出す
+// ============================================================
+const STORAGE_KEY = "hitsujun_rows";
+const HEADER = "participant,group,started,item_index,char,redo_count,stroke,point,x,y,t_ms,pressure,tilt_x,tilt_y";
+
+// 保存されている記録（CSVの行）を読み出す
+function loadRows() {
+  return localStorage.getItem(STORAGE_KEY) || "";
+}
+
+// 今の文字の記録を、CSVの行にして保存する
+function saveTrial() {
+  const head = [session.pid, session.group, session.started, index + 1, items[index], redoCount];
+  let text = "";
+  strokes.forEach((stroke, s) => {
+    stroke.forEach((p, n) => {
+      const row = head.concat([s + 1, n + 1, p.x, p.y, p.t, p.pressure, p.tiltX, p.tiltY]);
+      text += row.join(",") + "\n";
+    });
+  });
+  if (strokes.length === 0) {
+    text = head.concat([0, 0, "", "", "", "", "", ""]).join(",") + "\n";  // 空欄で進んだ印
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY, loadRows() + text);
+  } catch (err) {
+    alert("保存できませんでした。容量がいっぱいです。CSVを書き出してから記録を消してください。");
+  }
+}
+
+// 保存されている量を表示する
+function updateCount() {
+  const kb = Math.round(loadRows().length / 1024);
+  document.getElementById("count").textContent = "保存されている記録：約 " + kb + " KB";
+}
+
+// 「CSVを書き出す」
+document.getElementById("download").addEventListener("click", () => {
+  const rows = loadRows();
+  if (rows === "") {
+    alert("まだ記録がありません");
+    return;
+  }
+  const blob = new Blob(["﻿" + HEADER + "\n" + rows], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "hitsujun_" + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+// 「記録を消す」
+document.getElementById("clear").addEventListener("click", () => {
+  if (!confirm("保存されている記録をすべて消します。CSVは書き出しましたか？")) return;
+  localStorage.removeItem(STORAGE_KEY);
+  updateCount();
+});
+
+updateCount();
+</script>
+</body>
+</html>
